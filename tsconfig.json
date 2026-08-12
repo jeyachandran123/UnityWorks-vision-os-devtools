@@ -1,0 +1,51 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+
+    "types": ["vitest/globals", "@testing-library/jest-dom"],
+
+    // No `baseUrl`. It is deprecated and removed in TypeScript 7, and pinning
+    // it needs `ignoreDeprecations`, which the 5.9 CLI and the IDE's newer
+    // compiler disagree about: one rejects "6.0" with TS5103, the other demands
+    // it. Suppressing a deprecation that two toolchains describe differently is
+    // how a build breaks for one person and not another.
+    //
+    // Since TS 4.4 `paths` resolves relative to this file when the targets are
+    // relative, so dropping `baseUrl` is the migration rather than a workaround.
+    // Runtime resolution is unaffected — Vite and Vitest carry their own aliases.
+    "paths": {
+      "@contract/*": ["./src/contract/*"],
+      "@transport/*": ["./src/transport/*"],
+      "@state/*": ["./src/state/*"],
+      "@components/*": ["./src/components/*"],
+      "@panels/*": ["./src/panels/*"],
+      "@simulator/*": ["./src/simulator/*"],
+      "@/*": ["./src/*"]
+    }
+  },
+  // Application and test sources only. `vite.config.ts` and `vitest.config.ts`
+  // are excluded because vitest bundles its own copy of Vite: checking both
+  // configs in one program makes `Plugin<any>` from two Vite installs
+  // structurally incompatible, and the resulting error says nothing about this
+  // codebase. Both files are compiled by their own tool at run time.
+  "include": ["src", "tests"]
+}

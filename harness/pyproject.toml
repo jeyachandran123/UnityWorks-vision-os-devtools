@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vosvc-harness"
+version = "1.0.0"
+description = "Validation Harness for UnityWorks Vision OS — HTTP/WS transport + file acquisition adapters, built on public seams only."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+# Video decoding is OPTIONAL and degrades explicitly (V9, V8).
+# With neither extra installed the harness serves synthetic and frame-folder
+# sources and reports `mp4/avi/mkv: unavailable` in GET /capabilities — it does
+# not pretend to support a container it cannot open.
+av = ["av>=12.0"]
+cv = ["opencv-python-headless>=4.10"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "httpx>=0.27"]
+
+[project.scripts]
+vosvc-harness = "vosvc_harness.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["vosvc_harness*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = ["-v", "--tb=short"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

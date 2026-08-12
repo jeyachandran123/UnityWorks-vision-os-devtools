@@ -1,0 +1,13 @@
+"""Route groups. Each registers itself onto the FastAPI app."""
+
+from . import architecture, crops, model, observation_api, reports, sessions, streams
+
+__all__ = [
+    "architecture",
+    "crops",
+    "model",
+    "observation_api",
+    "reports",
+    "sessions",
+    "streams",
+]
