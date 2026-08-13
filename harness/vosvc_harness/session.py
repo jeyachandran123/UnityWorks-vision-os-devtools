@@ -410,6 +410,10 @@ class Session:
         settle_cycles = 12
         settle = 0
 
+        #: Whether end-of-media has been reported for the current pass. Reset
+        #: when the cursor moves off the end, so a restart announces it again.
+        announced = False
+
         try:
             while True:
                 stack = self.stack
@@ -425,12 +429,31 @@ class Session:
                     await asyncio.sleep(0.02)
                     continue
 
-                if self.cursor.exhausted:
+                if not self.cursor.exhausted:
+                    announced = False
+                elif not announced:
+                    # End of media, announced exactly once — and **not** returned
+                    # from.
+                    #
+                    # This used to `continue` here, which stopped the pump dead on
+                    # the same iteration that discovered the video had ended. The
+                    # last frame had been emitted at acquisition microseconds
+                    # earlier and still had detection → tracking → registry →
+                    # synthesis → state to travel; nothing advanced the clock or
+                    # drained the bridge again, so it never arrived. It was
+                    # replayed, it appeared in the frame ledger, and it produced
+                    # no observation — leaving the timeline permanently one frame
+                    # short of the end of the video.
+                    #
+                    # The settle cycles below already exist for exactly this
+                    # hazard, and their own comment says so: *"stopping the
+                    # instant the step budget empties would leave the frame
+                    # halfway down the pipeline."* Running out of video is the
+                    # same condition, and it was the one case that skipped them.
+                    announced = True
                     self.cursor.playing = False
                     self._set_state("paused")
                     self._note_transport("end_of_media", {"frame_index": self.cursor.index})
-                    await asyncio.sleep(0.02)
-                    continue
 
                 stack.clock.advance(Duration.from_millis(interval_ms))
                 for _ in range(8):

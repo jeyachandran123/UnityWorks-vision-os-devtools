@@ -16,7 +16,9 @@ from typing import Any
 
 from .sources.decoding import (
     CONTAINER_SUFFIXES,
+    DEFAULT_SAMPLE_FPS,
     IMAGE_SUFFIXES,
+    MAX_SAMPLED_FRAMES,
     DecodedFrame,
     DecodeUnavailableError,
     MediaProbe,
@@ -52,7 +54,13 @@ class MediaAsset:
     probe: MediaProbe | None = None
     error: str | None = None
     created_at_ns: int = field(default_factory=time.time_ns)
-    max_frames: int = 3600
+    #: The memory backstop, in sampled frames. Not a duration limit — see
+    #: `sample_fps`, which is what decides how much of a video is covered.
+    max_frames: int = MAX_SAMPLED_FRAMES
+    #: How often the video is sampled for analysis. The number of frames an
+    #: asset yields is its **duration** times this rate, so a longer video simply
+    #: produces more of them.
+    sample_fps: float = DEFAULT_SAMPLE_FPS
     _frames: list[DecodedFrame] | None = field(default=None, repr=False)
 
     @property
@@ -92,7 +100,13 @@ class MediaAsset:
             return frames
         if self.path is None:
             raise DecodeUnavailableError(f"'{self.name}' has no backing file to decode")
-        reader = VideoReader(self.path, max_frames=self.max_frames)
+        reader = VideoReader(self.path, max_frames=self.max_frames, sample_fps=self.sample_fps)
+        # The decoder walked the whole container and knows what was actually
+        # taken from it. Replacing the header probe with that keeps `frame_count`
+        # and `duration_ms` describing the frames a session will really replay —
+        # the header's numbers describe the source, and are kept beside them as
+        # `source_fps` / `source_frame_count`.
+        self.probe = reader.probe
         return reader.frames
 
     def to_wire(self) -> dict[str, Any]:
@@ -105,6 +119,7 @@ class MediaAsset:
             "decoded": self.decoded,
             "error": self.error,
             "created_at_ns": self.created_at_ns,
+            "sample_fps": self.sample_fps,
             "probe": (
                 {
                     "frame_count": self.probe.frame_count,
@@ -114,6 +129,9 @@ class MediaAsset:
                     "duration_ms": self.probe.duration_ms,
                     "backend": self.probe.backend,
                     "seekable": self.probe.seekable,
+                    "source_fps": self.probe.source_fps,
+                    "source_frame_count": self.probe.source_frame_count,
+                    "truncated": self.probe.truncated,
                 }
                 if self.probe
                 else None
@@ -124,7 +142,7 @@ class MediaAsset:
 class MediaLibrary:
     """The set of things an engineer can replay."""
 
-    def __init__(self, root: Path, *, max_frames: int = 3600) -> None:
+    def __init__(self, root: Path, *, max_frames: int = MAX_SAMPLED_FRAMES) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._assets: dict[str, MediaAsset] = {}

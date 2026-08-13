@@ -926,8 +926,23 @@ def build_stack(
         authorizer=StaticAuthorizer(
             [read_only_grant("console", tenant), full_grant("engineer", tenant)]
         ),
+        # `gaps` carries what the bound detector *cannot* do, alongside what it
+        # can. For a closed-set model that is the load-bearing half: a consumer
+        # reading `producible_classes` alone learns the eighty words available
+        # and not that everything else in the world is reported as whichever of
+        # those eighty is nearest. The detector declares it; this composition
+        # root forwards it; nothing interprets it on the way.
         capabilities=CapabilitySummary(
-            taxonomy_version="1", producible_classes=bound_detector.classes
+            taxonomy_version="1",
+            producible_classes=bound_detector.classes,
+            gaps=bound_detector.capability_gaps(),
+            models_in_use=(
+                (
+                    bound_detector.adapter_id,
+                    bound_detector.model_id,
+                    bound_detector.model_version,
+                ),
+            ),
         ),
     )
 

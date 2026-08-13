@@ -22,6 +22,44 @@ from pathlib import Path
 CONTAINER_SUFFIXES = frozenset({".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v"})
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".ppm"})
 
+#: How often a container is sampled for analysis, in frames per second.
+#:
+#: **A rate, not a count.** The number of frames a video yields is its duration
+#: times this number, so a 30-second clip gives 60 and a 20-minute one gives
+#: 2400. Nothing downstream caps that; the only ceiling is `MAX_SAMPLED_FRAMES`,
+#: which bounds memory and reports itself when it bites.
+#:
+#: Two per second is a perception decision, not a decoding one: a tracker needs
+#: enough temporal density to associate an object with itself between samples,
+#: and every frame beyond that costs detection time and buffer memory for
+#: information the previous frame already carried.
+DEFAULT_SAMPLE_FPS = 2.0
+
+#: The memory ceiling, in **sampled** frames — about 30 minutes at 2 fps.
+#:
+#: Frames are held decoded in RAM so a session can scrub without re-decoding, at
+#: roughly 2.7 MB each for 720p. This is what stops an unbounded decode of a
+#: four-hour recording from being a memory leak with a plausible excuse. When it
+#: bites, `MediaProbe.truncated` says so — a shortened video that claims to be
+#: complete is the failure this whole mechanism exists to remove.
+MAX_SAMPLED_FRAMES = 3600
+
+
+def sampling_stride(source_fps: float, sample_fps: float | None) -> int:
+    """How many source frames to advance between two analysis frames.
+
+    `round`, not `int`: at 24 fps and 2 fps wanted, truncation would give 12 and
+    so would rounding, but at 29.97 fps truncation gives 14 (2.14 fps) where
+    rounding gives 15 (1.998 fps). The sampled rate should sit on the requested
+    one from either side, not always above it.
+
+    Returns 1 — every frame — when no sampling was asked for or the source rate
+    is unknown, which keeps fixtures and single-image inputs untouched.
+    """
+    if not sample_fps or sample_fps <= 0 or source_fps <= 0:
+        return 1
+    return max(1, round(source_fps / sample_fps))
+
 
 @dataclass(frozen=True, slots=True)
 class DecodedFrame:
@@ -37,7 +75,14 @@ class DecodedFrame:
 
 @dataclass(frozen=True, slots=True)
 class MediaProbe:
-    """What a backend could determine about a file without decoding all of it."""
+    """What a backend could determine about a file without decoding all of it.
+
+    After a decode, `frame_count`, `fps` and `duration_ms` describe the **sampled**
+    set — what will actually be analysed. `source_fps` and `source_frame_count`
+    keep the container's own numbers alongside them, because "we analysed 28
+    frames" and "the video has 415" are both true and a reader needs both to
+    check that the whole clip was covered.
+    """
 
     frame_count: int
     width: int
@@ -46,6 +91,14 @@ class MediaProbe:
     duration_ms: float
     backend: str
     seekable: bool = True
+    #: The container's own rate. Equal to `fps` when nothing was sampled out.
+    source_fps: float = 0.0
+    #: Frames the container holds, as distinct from frames selected from it.
+    source_frame_count: int = 0
+    #: True when the memory ceiling stopped the decode before the video ended.
+    #: The tail was not analysed, and saying so is the difference between a
+    #: bounded tool and one that quietly reports on part of a video.
+    truncated: bool = False
 
 
 class DecodeUnavailableError(RuntimeError):
@@ -178,7 +231,7 @@ def can_decode(path: Path) -> bool:
 
 
 class VideoReader:
-    """Decodes a container to BGR24 frames.
+    """Decodes a container to BGR24 frames, **sampled across its whole length**.
 
     Deliberately **eager and bounded**: frames are decoded once, into memory, up
     to `max_frames`. A validation session replays the same frames repeatedly —
@@ -186,15 +239,32 @@ class VideoReader:
     re-decoding on every scrub would make timing measurements a property of the
     decoder rather than of Vision OS.
 
-    Bounded because an unbounded decode of a 4-hour CCTV file is a memory leak
-    with a plausible excuse.
+    Bounded by a **rate** first, though, which is the distinction that matters:
+    `sample_fps` decides which frames are taken and covers the entire video,
+    while `max_frames` is a memory backstop that reports itself through
+    `MediaProbe.truncated` when it stops a decode early. A count-shaped bound
+    used as the primary limit is what turned a 13-second video into a 4-second
+    one — it cut the *front* of the clip rather than thinning it.
+
+    Reading the whole container is not optional even at 2 fps: the decoder must
+    walk every packet to reach the last second of the file. What sampling avoids
+    is *retaining* and *analysing* all of them.
     """
 
     __slots__ = ("_frames", "_probe", "path")
 
-    def __init__(self, path: Path, *, max_frames: int = 3600, stride: int = 1) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_frames: int = MAX_SAMPLED_FRAMES,
+        stride: int = 1,
+        sample_fps: float | None = None,
+    ) -> None:
         self.path = path
-        frames, probe = _decode_all(path, max_frames=max_frames, stride=max(1, stride))
+        frames, probe = _decode_all(
+            path, max_frames=max_frames, stride=max(1, stride), sample_fps=sample_fps
+        )
         self._frames = frames
         self._probe = probe
 
@@ -219,10 +289,14 @@ class VideoReader:
 
 
 def _decode_all(
-    path: Path, *, max_frames: int, stride: int
+    path: Path, *, max_frames: int, stride: int, sample_fps: float | None = None
 ) -> tuple[list[DecodedFrame], MediaProbe]:
     suffix = path.suffix.lower()
 
+    # `.raw` sidecars, image folders and single images carry no independent
+    # source rate to resample from — the file *is* the sampled set. Sampling is
+    # a container concern, and applying it here would only thin out fixtures
+    # that were authored frame by frame on purpose.
     if suffix == ".raw":
         return _decode_raw(path, max_frames=max_frames)
     if suffix in IMAGE_SUFFIXES:
@@ -232,7 +306,9 @@ def _decode_all(
     av = _try_av()
     if av is not None and suffix in CONTAINER_SUFFIXES:
         try:
-            return _decode_with_av(av, path, max_frames=max_frames, stride=stride)
+            return _decode_with_av(
+                av, path, max_frames=max_frames, stride=stride, sample_fps=sample_fps
+            )
         except Exception as exc:  # noqa: BLE001 - fall through to the next backend
             last = exc
     else:
@@ -241,7 +317,9 @@ def _decode_all(
     cv2 = _try_cv2()
     if cv2 is not None and suffix in CONTAINER_SUFFIXES:
         try:
-            return _decode_with_cv2(cv2, path, max_frames=max_frames, stride=stride)
+            return _decode_with_cv2(
+                cv2, path, max_frames=max_frames, stride=stride, sample_fps=sample_fps
+            )
         except Exception as exc:  # noqa: BLE001
             last = exc
 
@@ -252,17 +330,22 @@ def _decode_all(
     )
 
 
-def _decode_with_av(av, path: Path, *, max_frames: int, stride: int):
+def _decode_with_av(av, path: Path, *, max_frames: int, stride: int, sample_fps=None):
     frames: list[DecodedFrame] = []
+    truncated = False
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         fps = float(stream.average_rate or 25.0)
-        width = int(stream.codec_context.width)
-        height = int(stream.codec_context.height)
+        # The stride is derived from the rate the container actually reports,
+        # which is knowable only here. A caller cannot compute it without opening
+        # the file, and one that guessed would sample the wrong instants — the
+        # tested clip is 30 fps, and a stride hardcoded for 24 samples it at
+        # 2.5 fps.
+        step = stride if stride > 1 else sampling_stride(fps, sample_fps)
         raw_index = 0
         for frame in container.decode(stream):
-            if raw_index % stride == 0:
+            if raw_index % step == 0:
                 array = frame.to_ndarray(format="bgr24")
                 frames.append(
                     DecodedFrame(
@@ -270,11 +353,17 @@ def _decode_with_av(av, path: Path, *, max_frames: int, stride: int):
                         payload=array.tobytes(),
                         width=array.shape[1],
                         height=array.shape[0],
-                        pts_ms=int(len(frames) * (1000.0 / max(fps, 1e-6))),
+                        # The **source** position, not the sampled ordinal. Using
+                        # the ordinal made every sampled frame claim to be one
+                        # source-frame period after the last, so a 60-second
+                        # video sampled at 2 fps reported itself as 2.5 seconds
+                        # long and the whole timeline collapsed.
+                        pts_ms=int(round(raw_index * (1000.0 / max(fps, 1e-6)))),
                         is_keyframe=bool(frame.key_frame),
                     )
                 )
                 if len(frames) >= max_frames:
+                    truncated = True
                     break
             raw_index += 1
 
@@ -285,34 +374,46 @@ def _decode_with_av(av, path: Path, *, max_frames: int, stride: int):
         frame_count=len(frames),
         width=frames[0].width,
         height=frames[0].height,
-        fps=fps / stride,
-        duration_ms=len(frames) * (1000.0 / max(fps / stride, 1e-6)),
+        fps=fps / step,
+        # The span of source actually walked, not the position of the last
+        # sample. Those differ by up to one sampling interval — a 5-second video
+        # whose last sample sits at 4.5 s is still 5 seconds long — and reporting
+        # the sample position would shorten every video by that much.
+        duration_ms=float(raw_index * (1000.0 / max(fps, 1e-6))),
         backend="pyav",
+        source_fps=fps,
+        source_frame_count=raw_index,
+        truncated=truncated,
     )
 
 
-def _decode_with_cv2(cv2, path: Path, *, max_frames: int, stride: int):
+def _decode_with_cv2(cv2, path: Path, *, max_frames: int, stride: int, sample_fps=None):
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise DecodeUnavailableError(f"OpenCV could not open '{path.name}'")
+    truncated = False
     try:
         fps = float(capture.get(cv2.CAP_PROP_FPS)) or 25.0
+        step = stride if stride > 1 else sampling_stride(fps, sample_fps)
         frames: list[DecodedFrame] = []
         raw_index = 0
-        while len(frames) < max_frames:
+        while True:
             ok, image = capture.read()
             if not ok:
                 break
-            if raw_index % stride == 0:
+            if raw_index % step == 0:
                 frames.append(
                     DecodedFrame(
                         index=len(frames),
                         payload=image.tobytes(),
                         width=int(image.shape[1]),
                         height=int(image.shape[0]),
-                        pts_ms=int(len(frames) * (1000.0 / max(fps, 1e-6))),
+                        pts_ms=int(round(raw_index * (1000.0 / max(fps, 1e-6)))),
                     )
                 )
+                if len(frames) >= max_frames:
+                    truncated = True
+                    break
             raw_index += 1
     finally:
         capture.release()
@@ -324,9 +425,12 @@ def _decode_with_cv2(cv2, path: Path, *, max_frames: int, stride: int):
         frame_count=len(frames),
         width=frames[0].width,
         height=frames[0].height,
-        fps=fps / stride,
-        duration_ms=len(frames) * (1000.0 / max(fps / stride, 1e-6)),
+        fps=fps / step,
+        duration_ms=float(raw_index * (1000.0 / max(fps, 1e-6))),
         backend="opencv",
+        source_fps=fps,
+        source_frame_count=raw_index,
+        truncated=truncated,
     )
 
 

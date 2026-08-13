@@ -250,3 +250,51 @@ class TestFullPipeline:
             assert "stream.lost" in seen or "stream.epoch_advanced" in seen, sorted(seen)
         finally:
             await session.shutdown()
+
+    async def test_end_of_media_still_settles_the_pipeline(self) -> None:
+        """End of media must not strand the frame that discovered it.
+
+        The pump used to `continue` the moment `cursor.exhausted` went true — on
+        the same iteration that emitted the final frame. That frame was still
+        travelling detection → tracking → registry → synthesis, and nothing
+        advanced the clock or drained the bridge again, so it never arrived: it
+        appeared in the frame ledger and in no observation, and the
+        Frame-by-Frame timeline was permanently one sample short of the end of
+        the video.
+
+        **Asserted on the clock, not on observations.** This suite binds the
+        scripted detector, which reports the same box on every frame, so exact
+        suppression correctly silences later frames — an absent observation for
+        the last frame is legitimate here and would make an observation-counting
+        assertion meaningless. What the fix changed is that the pump keeps
+        running after the video ends, and the virtual clock measures that
+        exactly: it advances once per cycle and not at all otherwise.
+        """
+        fps = 12.0
+        interval_ns = 10**9 / fps
+        decoded, _ = synthetic_frames(count=24, width=64, height=64)
+        session = Session(
+            SessionSpec(media_id="m-synthetic", target_fps=fps), decoded, media_name="synthetic"
+        )
+        await session.start()
+        try:
+            await session.play()
+
+            at_exhaustion: int | None = None
+            for _ in range(4000):
+                await asyncio.sleep(0.005)
+                if session.cursor.exhausted:
+                    at_exhaustion = session.stack.clock.now().ns
+                    break
+            assert at_exhaustion is not None, "the replay never reached the end of the video"
+
+            await asyncio.sleep(3.0)
+            after = session.stack.clock.now().ns
+
+            settled_cycles = (after - at_exhaustion) / interval_ns
+            assert settled_cycles >= 8, (
+                f"the pump advanced {settled_cycles:.1f} cycles after end of media; it "
+                f"stopped dead and the final frame is still mid-pipeline"
+            )
+        finally:
+            await session.shutdown()
