@@ -28,6 +28,12 @@ from .crops import CropArchive
 from .sources.faults import FaultLedger
 
 
+#: Providers that call a real model. Naming one of these is a statement that
+#: constants are not acceptable, so a failure to bind it fails the session
+#: rather than degrading to the constant head (see `_select_understander`).
+_REAL_PROVIDERS = frozenset({"nvidia", "ollama"})
+
+
 class VisionOsUnavailableError(RuntimeError):
     """Vision OS could not be imported.
 
@@ -310,8 +316,39 @@ def _buffer_sizing(*, frame_bytes: int, target_fps: float) -> tuple[int, int]:
 # use case a file rather than a patch.
 
 
-def build_attribute_registry(policy=None):
-    """The registered vocabulary — whatever the active policy declares.
+def load_policies(env: dict | None = None) -> tuple:
+    """Every active semantic policy, in declaration order.
+
+    ``VISION_SEMANTIC_POLICY`` accepts a **comma-separated list** of documents. A
+    single path is the degenerate case, so every configuration written before
+    this keeps working unchanged and no new environment variable is introduced.
+
+    A list is needed because a policy carries **one** subject-class scope, and
+    the two use cases this demo runs concern different subjects: kitchen PPE is
+    asked about `person`, and object corroboration is asked about the classes a
+    closed-set detector is least able to name. Forcing both into one document
+    would demand a head covering of a toothbrush.
+    """
+    import os
+
+    from app.vision_os.adapters.configuration.semantic_policy import (
+        POLICY_ENV,
+        SemanticPolicy,
+    )
+
+    source = os.environ if env is None else env
+    raw = str(source.get(POLICY_ENV, "")).strip()
+    if not raw:
+        return ()
+    return tuple(
+        SemanticPolicy.from_file(part.strip())
+        for part in raw.split(",")
+        if part.strip()
+    )
+
+
+def build_attribute_registry(policies=()) -> object:
+    """The registered vocabulary — whatever the active policies declare.
 
     Registration still goes through the platform's own `AttributeRegistry`, so
     every entry passes the neutrality gate: an enum without a domain is refused,
@@ -326,9 +363,24 @@ def build_attribute_registry(policy=None):
     from app.vision_os.perception.registry.attributes import AttributeRegistry
 
     registry = AttributeRegistry()
-    if policy is not None:
-        policy.register_attributes(registry)
+    for policy in policies:
+        if policy is not None:
+            policy.register_attributes(registry)
     return registry
+
+
+def _register_policy_demands(cropping, policies, warnings: list[str]) -> None:
+    """Raise **one demand per active policy**.
+
+    Separate demands, not one merged demand, because that is what keeps the two
+    use cases independent: kitchen PPE and object corroboration have different
+    subjects, different freshness and different budgets, and the Crop Manager
+    resolves the strictest freshness per attribute across whichever demands
+    happen to cover an object. Merging them would apply one policy's cadence to
+    the other's attributes.
+    """
+    for policy in policies:
+        _register_policy_demand(cropping, policy, warnings)
 
 
 def _register_policy_demand(cropping, policy, warnings: list[str]) -> None:
@@ -371,7 +423,7 @@ def _register_policy_demand(cropping, policy, warnings: list[str]) -> None:
         warnings.append(f"could not raise the policy demand: {type(exc).__name__}: {exc}")
 
 
-def _select_understander(warnings: list[str], policy=None):
+def _select_understander(warnings: list[str], policy=None, policies=()):
     """Ask Vision OS for the configured understander, or fall back **loudly**.
 
     **This function names no provider**, and that is the point. It used to
@@ -403,6 +455,9 @@ def _select_understander(warnings: list[str], policy=None):
         ProviderConfigurationError,
         build_understander,
     )
+    from app.vision_os.adapters.configuration.understander_providers import (
+        resolve_provider_name,
+    )
     from app.vision_os.adapters.understanding import StaticAttributeHead
     from app.vision_os.core.model.ids import AttributeKey
 
@@ -413,7 +468,13 @@ def _select_understander(warnings: list[str], policy=None):
         # unaffected — this is a platform without a use case, not a broken one.
         return None, "none (no semantic policy configured)"
 
-    producible = tuple(policy.attribute_keys) if policy else ()
+    # The union across every active policy: one adapter answers all of them, and
+    # an adapter that declared only the first policy's keys would make every
+    # other policy's attributes an unroutable capability gap.
+    active = tuple(policies) or ((policy,) if policy else ())
+    producible = tuple(
+        dict.fromkeys(key for p in active for key in p.attribute_keys)
+    )
 
     # What the constant head would answer, if it comes to that. Taken from the
     # policy's first requirement because only the policy knows a legal value —
@@ -423,6 +484,15 @@ def _select_understander(warnings: list[str], policy=None):
     first = policy.requirements[0] if policy and policy.requirements else None
     fallback_value = first.values[0] if first and first.values else ""
 
+    # `VOSVC_UNDERSTANDER` remains honoured as the console's own override, but it
+    # is passed *through* rather than interpreted: the harness does not know that
+    # "nvidia" means a hosted endpoint, and must not learn.
+    forced = os.environ.get("VOSVC_UNDERSTANDER", "").strip().lower() or None
+
+    # Which provider the deployment actually asked for. Resolved before any
+    # fallback, so a demo can insist on a real model.
+    requested = (forced or resolve_provider_name(os.environ)).strip().lower()
+
     def fall_back(reason: str):
         """The constant head, and the reason it was reached.
 
@@ -430,7 +500,22 @@ def _select_understander(warnings: list[str], policy=None):
         travels to the UI, and the model panel names whichever adapter is
         actually bound — a console showing "NVIDIA Vision" while a constant
         answered would be the single most dishonest thing it could do.
+
+        **When a real model was explicitly named, there is no fallback at all.**
+        A constant head answers one attribute with a fixed value; feed that to a
+        compliance rule and it produces a confident violation out of nothing.
+        Loud is not enough for that failure — a demo audience does not read the
+        warnings panel — so the session fails instead.
         """
+        if requested in _REAL_PROVIDERS:
+            raise VisionOsUnavailableError(
+                f"provider '{requested}' was requested and is unavailable: {reason}. "
+                f"Refusing to fall back to the constant-answer head: it produces "
+                f"fixed values that are indistinguishable from model output "
+                f"downstream, and a compliance rule evaluating them would report "
+                f"violations that nothing observed. Fix the provider, or set "
+                f"VISION_UNDERSTANDER_PROVIDER=static to accept constants knowingly."
+            )
         warnings.append(reason)
         # The head answers with one attribute; which one, and with what
         # value, is the policy's to say. Without a policy there is nothing to
@@ -446,11 +531,6 @@ def _select_understander(warnings: list[str], policy=None):
             StaticAttributeHead(attribute=fallback_key, value=fallback_value),
             f"static (fallback: {reason})",
         )
-
-    # `VOSVC_UNDERSTANDER` remains honoured as the console's own override, but it
-    # is passed *through* rather than interpreted: the harness does not know that
-    # "nvidia" means a hosted endpoint, and must not learn.
-    forced = os.environ.get("VOSVC_UNDERSTANDER", "").strip().lower() or None
 
     try:
         adapter, note = build_understander(
@@ -519,8 +599,14 @@ def _select_understander(warnings: list[str], policy=None):
     return adapter, note
 
 
-def build_prompt_pack(policy=None):
-    """The M10 stand-in — one prompt per policy, rendered from its document.
+def build_prompt_pack(policies=()):
+    """The M10 stand-in — **one prompt per policy**, rendered from its document.
+
+    `StaticPromptProvider` already takes a tuple of templates, and the engine
+    resolves the one whose `applies_to` covers the object's class. So two use
+    cases with different subjects need no plumbing beyond handing over two
+    templates: a person crop gets the PPE question and a candidate-object crop
+    gets the identity question, and neither prompt ever sees the other's crop.
 
     A prompt declaring an unregistered key is refused **at load** (the ceiling's
     second gate), so a policy whose prompt and attributes disagree fails before
@@ -532,13 +618,15 @@ def build_prompt_pack(policy=None):
     """
     from app.vision_os.adapters.understanding import StaticPromptProvider
 
-    if policy is None:
+    if not policies:
         # No prompt, because there is nothing to ask about. The engine treats an
         # absent prompt as a capability gap and says so, rather than inventing a
         # question.
         return StaticPromptProvider(())
 
-    return StaticPromptProvider((policy.build_prompt_template(),))
+    return StaticPromptProvider(
+        tuple(p.build_prompt_template() for p in policies if p is not None)
+    )
 
 
 # --- the Flow 3/4 bridge ---------------------------------------------------- #
@@ -666,6 +754,12 @@ class AssembledStack:
     source: Any
     decoder: Any
     warnings: list[str] = field(default_factory=list)
+    #: Every active semantic policy, in declaration order. Held so the console
+    #: can report which use cases are live without re-reading the environment.
+    policies: tuple = ()
+    #: The corroboration rules actually bound, or `None`. Reported for the same
+    #: reason: a demo claiming verification is on must be able to prove it.
+    verification: Any = None
 
     @property
     def api(self):
@@ -702,9 +796,12 @@ def build_stack(
     try:
         from app.vision_os.adapters.configuration import InMemoryConfigSource
         from app.vision_os.adapters.configuration.detector_providers import build_detector
-        from app.vision_os.adapters.configuration.semantic_policy import (
-            POLICY_ENV,
-            load_policy,
+        from app.vision_os.adapters.configuration.detector_providers import (
+            label_space_view,
+        )
+        from app.vision_os.adapters.configuration.semantic_policy import POLICY_ENV
+        from app.vision_os.adapters.configuration.verification_rules import (
+            load_verification_rules,
         )
         from app.vision_os.adapters.exposure.authorization import full_grant, read_only_grant
         from app.vision_os.adapters.exposure.authorization import StaticAuthorizer
@@ -800,17 +897,29 @@ def build_stack(
     # and means exactly what it says — no attributes registered, no demand
     # raised, therefore no model calls, with detection, tracking, state and the
     # Observation API running unchanged.
-    policy = load_policy()
-    if policy is None:
+    policies = load_policies()
+    policy = policies[0] if policies else None
+    if not policies:
         warnings.append(
             "no semantic policy configured; running without attribute understanding "
             f"(set {POLICY_ENV} to a policy document to enable it)"
         )
-    else:
+    for active in policies:
         warnings.append(
-            f"semantic policy: {policy.policy_id}@{policy.version} "
-            f"({len(policy.requirements)} attributes, "
-            f"freshness {policy.freshness_ms}ms)"
+            f"semantic policy: {active.policy_id}@{active.version} "
+            f"({len(active.requirements)} attributes on "
+            f"{list(active.object_classes) or 'any class'}, "
+            f"freshness {active.freshness_ms}ms)"
+        )
+
+    # The corroboration rules, or None. `None` means this deployment verifies
+    # nothing: `build_cropping_layer` then returns the unwrapped trigger policy
+    # and behaves exactly as it did before the seam existed.
+    verification = load_verification_rules()
+    if verification is not None and verification.rules:
+        warnings.append(
+            f"verification rules: {len(verification.rules)} rule(s) governing "
+            f"{sorted(str(k) for k in verification.governed_attributes)}"
         )
 
     # The artifact hash is the real file's `blake2b:<hex>` — the platform's own
@@ -855,13 +964,15 @@ def build_stack(
 
     # Registered through the platform's own registry, which applies the
     # neutrality gate to each one. A policy asks; the registry decides.
-    attributes = build_attribute_registry(policy)
+    attributes = build_attribute_registry(policies)
     registry_layer = build_registry_layer(platform, store=InMemoryObjectStore())
 
     # The Crop Manager must be told what the platform can currently produce.
     # Without this it has no reason to trigger a crop, because it would be
     # spending budget on an attribute nothing can answer (V7).
-    policy_keys = frozenset(policy.attribute_keys) if policy else frozenset()
+    policy_keys = frozenset(
+        key for active in policies for key in active.attribute_keys
+    )
 
     # The declared Flow 5 seam. `build_cropping_layer` takes a `crop_sink`, and
     # this is the console using it for what it is for: the crops M8 hands to M9
@@ -880,17 +991,25 @@ def build_stack(
             observed_cameras=frozenset({CameraId(camera_id)}),
         ),
         crop_sink=crop_archive.accept,
+        # What the bound detector can and cannot name, handed to M8 so a trigger
+        # policy can *act* on the capability the detector already declares — not
+        # merely report it to a consumer afterwards. Derived at the one place
+        # that holds both the detector and its declaration, so the two cannot
+        # drift.
+        label_space=label_space_view(bound_detector),
+        # The corroboration rules. `None` leaves the trigger policy unwrapped.
+        verification=verification,
         attach=True,
     )
 
-    understander, understanding_note = _select_understander(warnings, policy)
+    understander, understanding_note = _select_understander(warnings, policy, policies)
     understanding = build_understanding_layer(
         platform,
         cropping,
         # Empty when no policy is configured — legal, and documented as such
         # by `build_understanding_layer`.
         understanders=[understander] if understander is not None else [],
-        prompts=build_prompt_pack(policy),
+        prompts=build_prompt_pack(policies),
         attributes=attributes,
         attach=True,
     )
@@ -959,7 +1078,7 @@ def build_stack(
     )
     platform.runtime._admitted_consumer = detection_runtime  # noqa: SLF001 - the declared Flow 2 seam
 
-    _register_policy_demand(cropping, policy, warnings)
+    _register_policy_demands(cropping, policies, warnings)
 
     return AssembledStack(
         system=system,
@@ -971,6 +1090,8 @@ def build_stack(
         understanding=understanding,
         understander=understander,
         understanding_note=understanding_note,
+        policies=policies,
+        verification=verification,
         crop_archive=crop_archive,
         detection_runtime=detection_runtime,
         bridge=bridge,

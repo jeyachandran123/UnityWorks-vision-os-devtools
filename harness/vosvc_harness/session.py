@@ -88,6 +88,12 @@ class Session:
         self.bus_tap = EventBusTap(self.taps)
 
         self.stack: AssembledStack | None = None
+        #: The rule engine for this session, bound after boot because it needs
+        #: the session's own Observation API. `None` until then, and `None`
+        #: forever if the platform failed to assemble — a rule engine over a
+        #: platform that is not running would evaluate nothing while looking
+        #: like it was.
+        self.compliance: Any = None
         self.state = "created"
         self.error: str | None = None
         self.transport_history: list[dict[str, Any]] = []
@@ -204,6 +210,11 @@ class Session:
         # M14 subscription fan-out — the real, public observation stream.
         self._attach_observation_stream(stack)
 
+        # The rule engine, over this session's own Observation API. Attached
+        # after the stack exists and before the API is served, so a consumer's
+        # first compliance query never races the boot.
+        self._attach_compliance(stack)
+
         await stack.detection.start()
         await stack.detection_runtime.start()
         await stack.system.boot()
@@ -211,6 +222,42 @@ class Session:
         self._set_state("ready")
         if self.spec.autostart:
             await self.play()
+
+    def _attach_compliance(self, stack: AssembledStack) -> None:
+        """Bind the rule engine to this session's public read surface.
+
+        It is handed the `ObservationApi` and a principal, exactly as any
+        external consumer would be — not the state manager, not the registry,
+        not the observation log. That constraint is what keeps the compliance
+        layer a consumer rather than a module: it can reach only what a customer
+        integration can reach, so anything that works here works for them.
+
+        A failure is recorded and the session continues. Compliance is an
+        interpretation of observations; losing it costs a panel, not a run.
+        """
+        from .compliance import ComplianceLayer
+
+        try:
+            from app.vision_os.core.model.api import Principal
+
+            self.compliance = ComplianceLayer(
+                api=stack.api,
+                principal=Principal(subject="engineer", tenant_id=self.spec.tenant_id),
+            )
+            status = self.compliance.status
+            if not status.enabled:
+                self.taps.publish(
+                    "transport",
+                    "capability.gap",
+                    {"capability": "compliance", "reason": status.reason},
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.compliance = None
+            self.taps.publish(
+                "transport",
+                "capability.gap",
+                {"capability": "compliance", "reason": f"{type(exc).__name__}: {exc}"},
+            )
 
     def _attach_observation_stream(self, stack: AssembledStack) -> None:
         """Subscribe to M14 exactly as any external consumer would.

@@ -114,6 +114,21 @@ class HarnessConfig:
 
 
 def load_config() -> HarnessConfig:
+    """Build the process's configuration, demo defaults first.
+
+    The defaults must land in the environment **before** ``HarnessConfig`` is
+    constructed, because its fields read the environment in their own
+    ``default_factory``. Applying them afterwards sets the variables and leaves
+    the object everything else consults still holding the old values — which is
+    exactly the bug this call fixes: frame serving was enabled in the process and
+    the config object still reported it off.
+
+    Constructing ``HarnessConfig()`` directly bypasses this, which is what the
+    test-suite wants: a test asking for the library defaults should get them.
+    """
+    from .defaults import apply_demo_defaults
+
+    apply_demo_defaults()
     return HarnessConfig(
         host=os.environ.get("VOSVC_HOST", "127.0.0.1"),
         port=_int("VOSVC_PORT", 8808),

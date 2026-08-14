@@ -29,7 +29,16 @@ from .assembly import ensure_importable, probe_vision_os
 from .config import HarnessConfig, load_config
 from .contract import WIRE_MAJOR, WIRE_VERSION, encode, encode_error, status_for
 from .media import MediaLibrary
-from .routes import architecture, crops, model, observation_api, reports, sessions, streams
+from .routes import (
+    architecture,
+    crops,
+    findings,
+    model,
+    observation_api,
+    reports,
+    sessions,
+    streams,
+)
 from .session import SessionRegistry
 
 
@@ -57,6 +66,9 @@ class Harness:
 
 
 def create_app(config: HarnessConfig | None = None) -> FastAPI:
+    # `load_config()` applies the demo defaults before reading the environment.
+    # A caller that built its own `HarnessConfig` has already decided, and this
+    # does not second-guess it.
     config = config or load_config()
     harness = Harness(config)
 
@@ -231,6 +243,7 @@ def create_app(config: HarnessConfig | None = None) -> FastAPI:
     architecture.register(app, harness)
     reports.register(app, harness)
     model.register(app, harness)
+    findings.register(app, harness)
     # Retained crop retrieval. Reads only, gated like frame serving.
     crops.register(app, harness)
 
