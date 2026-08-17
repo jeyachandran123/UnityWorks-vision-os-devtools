@@ -215,6 +215,12 @@ def build_config_document(
         "cropping": {
             "enabled": True,
             "understanding_calls_per_hour": 360_000.0,
+            # Part-focused, so the canonical crop is spent on the region a
+            # question is about rather than on the black bars either side of a
+            # letterboxed standing person. The regions come from the policy
+            # documents; this only names the strategy, and with no regions
+            # declared it plans the whole box exactly as `crop.padded` did.
+            "crop_strategy": "crop.part_focused",
             # 224, not 64. This is the image the model is asked about, and a
             # 64x64 person is a smudge — the attribute quality a VLM can reach
             # is bounded by what it was shown. It is also what a reviewer sees
@@ -991,6 +997,14 @@ def build_stack(
             observed_cameras=frozenset({CameraId(camera_id)}),
         ),
         crop_sink=crop_archive.accept,
+        # Where on a subject each demanded attribute is visible, merged across
+        # every active policy. Only `crop.part_focused` reads it; the default
+        # strategy ignores it and behaves exactly as before.
+        evidence_regions={
+            key: span
+            for active in policies
+            for key, span in active.evidence_regions.items()
+        },
         # What the bound detector can and cannot name, handed to M8 so a trigger
         # policy can *act* on the capability the detector already declares — not
         # merely report it to a consumer afterwards. Derived at the one place
