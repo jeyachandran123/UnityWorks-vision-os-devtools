@@ -760,6 +760,9 @@ class AssembledStack:
     source: Any
     decoder: Any
     warnings: list[str] = field(default_factory=list)
+    #: Why M9 attributes did or did not reach M7. Counters only — a silent
+    #: discard is indistinguishable from a silent success without them.
+    writeback_audit: dict = field(default_factory=dict)
     #: Every active semantic policy, in declaration order. Held so the console
     #: can report which use cases are live without re-reading the environment.
     policies: tuple = ()
@@ -971,7 +974,18 @@ def build_stack(
     # Registered through the platform's own registry, which applies the
     # neutrality gate to each one. A policy asks; the registry decides.
     attributes = build_attribute_registry(policies)
-    registry_layer = build_registry_layer(platform, store=InMemoryObjectStore())
+    # M7 and M9 must agree on the vocabulary, and the Semantic Ceiling is only
+    # canonical if there is exactly one of it. Built without this, M7 validates
+    # against an empty registry and refuses every policy attribute M9 produces —
+    # `AttributeRejectedError: attribute 'head_covering' is not registered`, 308
+    # times out of 308 in Phase 6.8, which made every stored observation, and so
+    # every freshness decision, unreachable.
+    #
+    # The same *instance*, not an equivalent copy: two registries holding equal
+    # definitions would drift the moment a policy is reloaded on one side.
+    registry_layer = build_registry_layer(
+        platform, store=InMemoryObjectStore(), attributes=attributes
+    )
 
     # The Crop Manager must be told what the platform can currently produce.
     # Without this it has no reason to trigger a crop, because it would be
@@ -1005,6 +1019,24 @@ def build_stack(
             for active in policies
             for key, span in active.evidence_regions.items()
         },
+        # Canonical crop size per attribute, merged across policies. Framing and
+        # resolution are separate losses: narrowing to the head band stops
+        # spending the canvas on legs, but the band is still resampled to the
+        # canonical size, so a hairnet arrives as ~30px either way. Raised per
+        # attribute rather than globally because vision tokens scale with area.
+        output_sizes={
+            key: size
+            for active in policies
+            for key, size in active.output_sizes.items()
+        },
+        # Quality floors per attribute, merged across policies. A head band and
+        # a whole-person crop are not usable at the same scale, and the document
+        # that declared the attribute is the only thing that knows which.
+        quality_floors={
+            key: floors
+            for active in policies
+            for key, floors in active.quality_floors.items()
+        },
         # What the bound detector can and cannot name, handed to M8 so a trigger
         # policy can *act* on the capability the detector already declares — not
         # merely report it to a consumer afterwards. Derived at the one place
@@ -1017,6 +1049,53 @@ def build_stack(
     )
 
     understander, understanding_note = _select_understander(warnings, policy, policies)
+    writeback_audit: dict = {"applied": 0, "rejected": 0, "no_object_id": 0,
+                             "failed_outcome": 0, "reasons": {}}
+
+    def _hold_attributes_in_the_registry(results) -> None:
+        """The M9 -> M7 seam: hand each produced attribute to the object registry.
+
+        `RegistryEngine.apply_attribute` documents itself as *"exists in M7's
+        documented API and will be called from Flow 5"*. Nothing called it, so
+        `VisualObject.attributes` stayed empty — and `TriggerPolicy` reads exactly
+        that to decide freshness. The result was `ATTRIBUTE_MISSING` on every
+        frame for the same tracked person, re-requesting a VLM answer the platform
+        had already paid for (Phase 6.3/6.4).
+
+        This is a *hold*, not a produce: M9 extracted the value, M7 keeps it. The
+        registry stays the single source of attribute freshness — no second cache
+        here, and `TriggerPolicy` is untouched.
+
+        Failures are skipped rather than stored. An attribute written for a failed
+        understanding would make the platform believe it knows something it never
+        successfully observed, which is the opposite of what this seam is for.
+        """
+        engine = registry_layer.registry
+        for result in results:
+            if result.object_id is None:
+                writeback_audit["no_object_id"] += 1
+                continue
+            if result.outcome.is_failure:
+                writeback_audit["failed_outcome"] += 1
+                continue
+            for attribute in result.attributes:
+                try:
+                    engine.apply_attribute(result.object_id, attribute)
+                    writeback_audit["applied"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    # The registry's own validation (unregistered key, class
+                    # applicability, unknown object) refused it. A rejected
+                    # attribute must not break understanding and must not be
+                    # stored — but the *reason* must survive, or a silent
+                    # discard becomes indistinguishable from a silent success
+                    # (Phase 6.7 lost a whole diagnosis to exactly that).
+                    key = f"{type(exc).__name__}: {str(exc)[:90]}"
+                    writeback_audit["rejected"] += 1
+                    writeback_audit["reasons"][key] = (
+                        writeback_audit["reasons"].get(key, 0) + 1
+                    )
+                    continue
+
     understanding = build_understanding_layer(
         platform,
         cropping,
@@ -1025,6 +1104,7 @@ def build_stack(
         understanders=[understander] if understander is not None else [],
         prompts=build_prompt_pack(policies),
         attributes=attributes,
+        understanding_sink=_hold_attributes_in_the_registry,
         attach=True,
     )
 
@@ -1115,4 +1195,5 @@ def build_stack(
         source=source,
         decoder=decoder,
         warnings=warnings,
+        writeback_audit=writeback_audit,
     )

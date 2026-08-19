@@ -33,3 +33,5 @@ media/
 *.mp4
 *.avi
 *.mkv
+# Session crop artifacts. Regenerated on every replay, referenced by no dataset.
+crops/
