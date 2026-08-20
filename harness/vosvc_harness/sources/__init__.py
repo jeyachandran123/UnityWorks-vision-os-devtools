@@ -1,5 +1,16 @@
 """Validation source adapters — P1/P2 implementations for recorded video."""
 
+from .cctv import (
+    CameraConfig,
+    CameraCredentials,
+    CameraState,
+    CameraStatus,
+    LiveRtspSource,
+    ReconnectPolicy,
+    cameras_from_env,
+    parse_channels,
+    selected,
+)
 from .adapters import (
     RAW_CODEC,
     ReplayCursor,
@@ -40,6 +51,15 @@ __all__ = [
     "ReplayCursor",
     "ReplayFileSource",
     "RtspReplaySource",
+    "CameraConfig",
+    "CameraCredentials",
+    "CameraState",
+    "CameraStatus",
+    "LiveRtspSource",
+    "ReconnectPolicy",
+    "cameras_from_env",
+    "parse_channels",
+    "selected",
     "Scenario",
     "ValidationDecoder",
     "VideoReader",

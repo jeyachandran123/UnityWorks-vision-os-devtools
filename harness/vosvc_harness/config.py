@@ -55,6 +55,21 @@ class HarnessConfig:
     host: str = "127.0.0.1"
     port: int = 8808
 
+    #: "file" (recorded media) or "rtsp" (live CCTV). File remains the default,
+    #: so every existing replay, test and comparison keeps working untouched —
+    #: live is added beside it, never in place of it.
+    video_source: str = field(
+        default_factory=lambda: os.environ.get("VIDEO_SOURCE", "file").strip() or "file"
+    )
+    #: The DVR. Empty means no live cameras are configured, which is a valid
+    #: state and not an error.
+    cctv_host: str = field(default_factory=lambda: os.environ.get("CCTV_HOST", "").strip())
+    #: Explicit allowlist, e.g. "1,2,5,7". Empty selects **nothing**: a
+    #: 16-channel DVR must not become 16 pipelines by default.
+    cctv_channels: str = field(
+        default_factory=lambda: os.environ.get("CCTV_CHANNELS", "").strip()
+    )
+
     #: Where the Vision OS package can be imported from. The harness adds this to
     #: ``sys.path`` and imports ``app.vision_os`` — the platform's public
     #: composition roots and nothing else. It never writes here.
